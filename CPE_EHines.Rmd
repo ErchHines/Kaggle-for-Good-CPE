@@ -1,0 +1,251 @@
+---
+title: "CPE - Mapping census and police data together"
+author: "Erich Hines"
+date: "10/27/2018"
+output: 
+  html_document:
+    number_sections: true
+    toc: true
+    fig_width: 10
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+The purpose of this kernel is to try to begin finding some methods for plotting census and police department data together on the same map. This will begin by using dot density maps for displaying the relevant information because these can be particularly helpful for displaying census data and because the transformations needed to make these work also make other visualizations easier to display in many cases. For this, just the datasets related to Boston were used to begin. Some of the packages that wll be used include tidycensus for downloading our census data in a way that is easier to map quickly, googleway for geocoding locations based on the address, and tmap for mapping. 
+
+## Load the required libraries
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(tidycensus)
+library(tidyverse)
+library(censusapi)
+library(dplyr)
+library(sf)
+library(data.table)
+library(rgdal)
+library(tmap)
+library(ggmap)
+library(googleway)
+```
+
+## Loading data
+
+Here we will load in the data we are going to use from the provided files. 
+
+```{r loading, message=FALSE, warning=FALSE}
+#Read in our police district data
+police_districts <- readOGR(
+  dsn = "data/Dept_11-00091/11-00091_Shapefiles", 
+  layer = "boston_police_districts_f55"
+)
+
+#Read in our incidents file, skipping the first row where it appears the headers
+#are mostly just slightly reworded
+police_incidents <- read.csv(
+  "data/Dept_11-00091/11-00091_Field-Interviews_2011-2015.csv", 
+  skip = 1, header = TRUE
+)
+```
+
+So far we have only used the police department data as well as the shp file containing the districts. Instead tidycensus will be used to bring in our census. 
+
+# Census Stuff
+
+The provided ACS tables were not used for a couple of reasons. First, they are subject tables as indicated by the prefix 'S'. Because these tables contain data aggregated by the US census they can sometimes be more difficult to use in mapping and other applications and they are less detailed. It is often more useful to begin by pulling in data from base tables as indicated by the 'B' prefix since these contain the most detailed information for the ACS. Secondly, the annotations were merged into the data file itself. Having the annotations can sometimes make the table harder to read into R, for instance a revision is sometimes annotated in parentheses within a numeric column. Lastly, in the case of Boston, it appears the provided census information was for Worcester county instead of Suffolk where Boston is located. 
+
+Instead information will pulled using tidycensus. This provides us a number of advantages. It will bring in all the relevant geographies, making it unnecessary to download the shape files for the entire state and filter down to the county level. It also allows for census data to be downloaded using the names of the counties and abbreviations for the states instead of looking up the FIPS codes. 
+
+Bringing in tidycensus:
+
+```{r tidycensus, message=FALSE, warning=FALSE, results='hide'}
+#First, geet a list of our metadata to help select which tables we want to use
+v16 <- load_variables(2016, "acs5", cache = TRUE)
+
+#Pull in acs data using tidycensus, for this kernel we will start with education data
+acs_edu <- get_acs("tract", 
+                   table = "B15003", 
+                   cache_table = TRUE,
+                   geometry = TRUE, 
+                   survey = "acs5", 
+                   state = "MA", county = "Suffolk",
+                   year = 2016, output = "wide")
+
+```
+
+Next we still need to do some cleaning up to make mapping easier. We will begin by dropping the 'margin of error' columns since it won't be used for mapping and combining the large number of categories into a smaller, easier to use number. 
+
+```{r cleaning census, message=FALSE, warning=FALSE}
+#Remove all the margin of error columns
+acs_edu <- acs_edu[, -grep("\\M$", colnames(acs_edu))]
+
+#Group education into mappable categories
+acs_edu <- acs_edu %>%
+  mutate(less_than_high_school = rowSums(acs_edu[,4:18,drop = TRUE]),      #nursery through 12th grade
+         high_school_diploma = acs_edu[,19,drop=TRUE],                     #High school diploma only
+         GED = acs_edu[,20,drop=TRUE],                                     #Ged only
+         some_college_associates = rowSums(acs_edu[,21:23,drop = TRUE]),   #Some college / associates
+         bachelors = acs_edu[,24,drop=TRUE],                               #bachelor's only
+         post_graduate = rowSums(acs_edu[,25:27,drop = TRUE])) %>%         #Master's, pHD, prof. 
+  select(-(3:27))
+
+```
+
+
+Now, we can begin by plotting our base map using tmap:
+
+```{r map 1}
+tm_shape(acs_edu) +
+  tm_polygons(alpha = 0.1)
+```
+
+We also have the relevant police shp file that we can plot over the census tracts
+
+```{r map 2}
+tm_shape(acs_edu) +
+  tm_polygons(alpha = 0.1) +
+tm_shape(police_districts) + 
+  tm_polygons( col = "blue", alpha = 0.3, lwd = 5)
+```
+
+# Creating dot density maps
+
+Now we're going to create dot density maps of our education data using the categories we just created. An example of these types of maps for census data can be found at the NYTimes Mapping Segregation page, https://www.nytimes.com/interactive/2015/07/08/us/census-race-map.html. 
+
+A helfpul tutorial for creating these maps that a lot of this is pulled from can be found here: https://www.cultureofinsight.com/blog/2018/05/02/2018-04-08-multivariate-dot-density-maps-in-r-with-sf-ggplot2/
+
+Below is the code begin creating the dots we will use for our map. This includes a custom function found at the above link to apply a random rounding algorithm on the floats to avoid any systematic bias in overall dot counts. Because creating a dot for every single person represented in the ACS will be time intensive, for this we will start by having each dot represent 25 people. 
+
+```{r dots, message=FALSE, warning=FALSE}
+random_round <- function(x) {
+  v=as.integer(x)
+  r=x-v
+  test=runif(length(r), 0.0, 1.0)
+  add=rep(as.integer(0),length(r))
+  add[r>test] <- as.integer(1)
+  value=v+add
+  ifelse(is.na(value) | value<0,0,value)
+  return(value)
+}
+
+num_dots <- as.data.frame(acs_edu) %>% 
+  select(less_than_high_school:post_graduate) %>% 
+  mutate_all(funs(. / 25)) %>% 
+  mutate_all(random_round)
+
+census_dots <- map_df(names(num_dots), 
+                  ~ st_sample(acs_edu, size = num_dots[,.x], type = "random") %>% # generate the points 
+                    st_cast("POINT") %>%                                          # cast the geom set 
+                    st_coordinates() %>%                                          # pull out coordinates 
+                    as_tibble() %>%                                               # convert to tibble
+                    setNames(c("lon","lat")) %>%                                  # set column names
+                    mutate(education = .x)                                        # categories
+) %>% 
+  slice(sample(1:n()))
+
+
+```
+
+
+## Converting our data to use the same coordinate systems
+
+Both our census data and police shp files use different coordinate systems so before going forward it will be helpful to tranform the geometries into the coordinate system used by google maps, osm, etc.
+
+```{r coords, message=FALSE, warning=FALSE}
+#Convert dots to spdf and reproject to epsg:4268
+CRS_new <- CRS("+init=epsg:4326") 
+
+census_dots_tm <- SpatialPointsDataFrame(
+  coords = census_dots[,c("lon","lat")], data = census_dots)
+proj4string(census_dots_tm) <- "+proj=longlat +datum=NAD83 +no_defs"
+raster::projection(census_dots_tm)="+init=epsg:4269"
+census_dots_tm <- spTransform(census_dots_tm, CRS_new)
+
+#Our police distrists need to be converted as well
+raster::projection(police_districts)="+init=epsg:2249"
+police_districts <- spTransform(police_districts, CRS_new)
+
+```
+
+## Plotting the dots
+
+Now we can begin plotting our dots representing education data. Using tmaps makes this pretty simple. 
+
+```{r map 3, message=FALSE, warning=FALSE}
+tm_shape(acs_edu) +
+  tm_polygons(alpha = 0.1) +
+tm_shape(police_districts) + 
+  tm_polygons( col = "blue", alpha = 0.3, lwd = 5) +
+tm_shape(census_dots_tm) + 
+  tm_dots("education", alpha = 0.9, scale = 0.9, legend.show = FALSE)
+```
+
+
+# Getting location data for police incidents in Boston. 
+
+Since Boston doesn't provide lat and long for their incidents, we will use their LOCATION and CITY data for geocoding to try and get plottable locations. This is far from perfect given how the address information has been recorded and you can see that some of the locations to be plotted likely aren't accurate but this is to get started and that information we will be looked at in more detail in the next version of this kernel. 
+
+We are also going to begin by just using the 'HOMICIDE' incidents from our data since this more manageable for starting out. 
+
+Note: To run this on your own without error, you will likely need a google maps API key. 
+
+```{r police dots, message=FALSE, warning=FALSE}
+police_incidents$address_city <- ifelse(
+  police_incidents$CITY == "NO DATA ENTERED" | police_incidents$CITY == "OTHER",
+  paste(police_incidents$LOCATION, ", Boston, MA", sep = ""), 
+  paste(police_incidents$LOCATION, ", ", police_incidents$CITY, ", MA", sep ="")
+)
+
+#Let's start by working with homicides as a more manageable subset
+homicides <- police_incidents[police_incidents$FIOFS_REASONS == "HOMICIDE",]
+```
+
+To run the following code, a google maps API key is needed
+```{r googleway code, eval=FALSE, message=FALSE, warning=FALSE}
+geocoded <- data.frame(stringsAsFactors = FALSE)
+
+for(i in 1:nrow(homicides))
+{
+  result <- google_geocode(address = homicides$address_city[i], key = key, simplify = TRUE)
+  homicides$lon[i] <- as.numeric(result$results$geometry$location$lng[1])
+  homicides$lat[i] <- as.numeric(result$results$geometry$location$lat[1])
+}
+
+homicides_tm <- SpatialPointsDataFrame(
+  coords = homicides[,c("lon","lat")], data = homicides)
+
+```
+
+Finally let's put it all together. 'View' mode is going to be used for tmap to provide some interactiion and to select which layers the user would like to see. Additionally, I'm still trying to figure out better ways to have the dots and bubbles scale. 
+
+# Putting it all together
+
+```{r map 4, message=FALSE, warning=FALSE}
+#load in the homicide location data from geocoding
+load(file = "homicides_tm.rda")
+
+tmap_mode("view")
+
+tm_shape(acs_edu) +
+  tm_polygons(alpha = 0.1) +
+tm_shape(police_districts) + 
+  tm_polygons( col = "blue", alpha = 0.3, lwd = 5) +
+tm_shape(census_dots_tm) + 
+  tm_dots("education", alpha = 0.9,
+          scale = 0.8, legend.size.is.portrait = TRUE) +
+tm_shape(homicides_tm) +
+  tm_bubbles(col = "red", size = 0.85)  +
+tm_layout(basemaps = c('OpenStreetMap'))
+```
+
+# Finishing Thoughts and Next Steps
+
+There are still many issues to sort out within the data and some issues to figure out in order to make this more presentable. Next steps will be to begin plotting this information for the other cities in the dataset and see if the issues presented by Boston are similar or different in those cases.
+
+
